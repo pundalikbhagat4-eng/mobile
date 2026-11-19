@@ -1,0 +1,4 @@
+* { box-sizing: border-box; }
+html { min-width: 320px; background: #fffefa; }
+body { min-width: 320px; margin: 0; }
+#root { min-height: 100vh; }
