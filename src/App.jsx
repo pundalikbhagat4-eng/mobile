@@ -50,6 +50,11 @@ const roomSeed = [
   { number: '205', type: 'Deluxe King', status: 'cleaning', guest: '', until: 'Ready by 1:00 pm', price: 4800 },
   { number: '206', type: 'Courtyard Twin', status: 'available', guest: '', until: '', price: 5200 },
 ]
+const roomTypeSeed = [...new Set(roomSeed.map((room) => room.type))].map((name, index) => ({
+  id: `demo-type-${index}`,
+  name,
+  base_price: roomSeed.find((room) => room.type === name).price,
+}))
 
 const navItems = [
   { label: 'Overview', icon: Sparkles, roles: ['owner', 'reception', 'housekeeping'] },
@@ -66,6 +71,11 @@ const titleCase = (value) => String(value).replaceAll('_', ' ').replace(/\b\w/g,
 const localDate = (date) => new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 10)
 const dateToday = localDate(new Date())
 const dateAfterTwoNights = localDate(new Date(Date.now() + 86400000 * 2))
+const bookingErrorMessage = (message, room) => {
+  if (!/(?:cannot|can't|unable to|could not).{0,40}book.{0,40}(?:room|time)|book.{0,40}at this time/i.test(message)) return message
+  const place = room ? `Room ${room.number}` : 'a room of this type'
+  return `We couldn't reserve ${place} for those dates. It may already be booked or not ready. Try different dates or another room type. If you still need help, contact reception.`
+}
 
 function readDemoList(key, fallback) {
   try {
@@ -89,6 +99,7 @@ function App() {
   const [csrfToken, setCsrfToken] = useState(() => localStorage.getItem('serein-csrf') || '')
   const [bookings, setBookings] = useState(() => DEMO_MODE ? readDemoList('serein-bookings', []) : [])
   const [rooms, setRooms] = useState(() => DEMO_MODE ? readDemoList('serein-rooms', roomSeed) : [])
+  const [roomTypes, setRoomTypes] = useState(() => DEMO_MODE ? roomTypeSeed : [])
   const [filter, setFilter] = useState('all')
   const [search, setSearch] = useState('')
   const [toast, setToast] = useState('')
@@ -155,6 +166,10 @@ function App() {
             until: room.current_check_out || '',
             price: Number(room.base_price),
           })))
+      }
+      if (permissions.includes('rooms.create')) {
+        const typeResult = await apiRequest('/room-types')
+        setRoomTypes(typeResult.room_types)
       }
       if (permissions.includes('bookings.view')) {
         const result = await apiRequest('/bookings')
@@ -226,6 +241,7 @@ function App() {
           check_in: form.checkIn,
           check_out: form.checkOut,
           room_type: form.roomType,
+          ...(form.roomId ? { room_id: form.roomId } : {}),
           source: form.source,
           source_name: form.sourceName,
           adults: form.adults,
@@ -317,8 +333,41 @@ function App() {
     setToast(`Room ${roomNumber} marked ${statusNames[status].toLowerCase()}`)
   }
 
+  async function createRoom(form) {
+    const roomType = roomTypes.find((item) => String(item.id) === String(form.room_type_id))
+    if (!roomType) throw new Error('Choose a valid room type.')
+    if (!DEMO_MODE) {
+      const result = await apiRequest('/rooms', { method: 'POST', csrfToken, body: form })
+      setRooms((items) => [...items, {
+        id: Number(result.id),
+        number: result.room_number,
+        type: roomType.name,
+        status: result.status,
+        guest: '',
+        until: '',
+        price: Number(roomType.base_price),
+      }].sort((a, b) => a.number.localeCompare(b.number, undefined, { numeric: true })))
+    } else {
+      const status = form.status
+      setRooms((items) => [...items, {
+        id: `demo-room-${Date.now()}`,
+        number: form.room_number,
+        type: roomType.name,
+        status,
+        guest: '',
+        until: '',
+        price: Number(roomType.base_price),
+      }].sort((a, b) => a.number.localeCompare(b.number, undefined, { numeric: true })))
+    }
+    setToast(`Room ${form.room_number} added and ready for bookings.`)
+  }
+
   async function updateBooking(booking, status, staffRemarks) {
     if (!DEMO_MODE) {
+      if (!Number.isSafeInteger(Number(booking.databaseId)) || Number(booking.databaseId) < 1) {
+        setToast('This booking cannot be updated because its database ID is missing. Refresh the bookings list and try again.')
+        return
+      }
       try {
         await apiRequest(`/bookings/${booking.databaseId}`, { method: 'PATCH', csrfToken, body: { status, staff_remarks: staffRemarks } })
         await refreshLiveData(user.permissions)
@@ -372,6 +421,9 @@ function App() {
       onLogin={signIn}
       onBooking={saveBooking}
       rooms={rooms}
+      roomTypes={roomTypes}
+      canCreateRooms={DEMO_MODE ? role === 'owner' : user.permissions?.includes('rooms.create')}
+      onCreateRoom={createRoom}
       filteredRooms={filteredRooms}
       bookings={bookings}
       filter={filter}
@@ -506,7 +558,7 @@ function App() {
   )
 }
 
-function Dashboard({ user, role, guestEmail, currentUserEmail, onExportRevenue, onUpdateBooking, onGuestNote, csrfToken, onToast, modal, onCloseModal, onLogin, onBooking, rooms, filteredRooms, bookings, filter, setFilter, search, setSearch, onNavigate, onSignOut, onNewBooking, onRoomClick, onRoomStatus, onRoomBooking, toast }) {
+function Dashboard({ user, role, guestEmail, currentUserEmail, onExportRevenue, onUpdateBooking, onGuestNote, csrfToken, onToast, modal, onCloseModal, onLogin, onBooking, rooms, roomTypes, canCreateRooms, onCreateRoom, filteredRooms, bookings, filter, setFilter, search, setSearch, onNavigate, onSignOut, onNewBooking, onRoomClick, onRoomStatus, onRoomBooking, toast }) {
   const [activeNav, setActiveNav] = useState(role === 'guest' ? 'My stays' : 'Overview')
   const visibleNav = role === 'guest'
     ? [{ label: 'My stays', icon: CalendarDays, roles: ['guest'] }]
@@ -554,7 +606,7 @@ function Dashboard({ user, role, guestEmail, currentUserEmail, onExportRevenue, 
             activeNav === 'Revenue' ? <RevenueView onExport={onExportRevenue} /> :
               activeNav === 'Expenses' ? <ExpensesView csrfToken={csrfToken} onToast={onToast} /> :
                 activeNav === 'Team & access' ? <TeamView csrfToken={csrfToken} currentUserEmail={currentUserEmail} onToast={onToast} /> :
-                  <RoomsSettings rooms={rooms} onRoomStatus={onRoomStatus} onNewBooking={onNewBooking} />}
+                  <RoomsSettings rooms={rooms} roomTypes={roomTypes} canCreateRooms={canCreateRooms} onCreateRoom={onCreateRoom} onRoomStatus={onRoomStatus} onNewBooking={onNewBooking} />}
         </div>
       </main>
       {modal && <Modal type={modal.type} roomType={modal.roomType} room={modal.room} onClose={onCloseModal} onLogin={onLogin} onBooking={onBooking} onRoomStatus={onRoomStatus} onRoomBooking={onRoomBooking} />}
@@ -580,11 +632,12 @@ function BookingsView({ bookings, onNewBooking, onUpdateBooking, onGuestNote, is
   const guestBookings = bookings.filter((booking) => (
     (booking.email || booking.guest_email || '').toLowerCase() === guestEmail?.toLowerCase()
   ))
-  const rows = isGuest ? guestBookings : [...bookings, ...[
+  const demoBookings = DEMO_MODE ? [
     { id: 'SR-240118', name: 'Kavya & Nikhil', roomType: 'Garden Suite', roomNumber: '102', checkIn: 'Nov 19, 2026', checkOut: 'Nov 22, 2026', total: 19200, source: 'Direct', status: 'Confirmed', statusValue: 'confirmed' },
     { id: 'SR-240116', name: 'Maya Shah', roomType: 'Courtyard Twin', roomNumber: '104', checkIn: 'Nov 17, 2026', checkOut: 'Nov 20, 2026', total: 15600, source: 'Booking.com', status: 'Checked in', statusValue: 'checked_in' },
     { id: 'SR-240111', name: 'Ishaan Rao', roomType: 'Palm Residence', roomNumber: '201', checkIn: 'Nov 16, 2026', checkOut: 'Nov 19, 2026', total: 24600, source: 'Walk-in', status: 'Checked out', statusValue: 'checked_out' },
-  ]]
+  ] : []
+  const rows = isGuest ? guestBookings : [...bookings, ...demoBookings]
   const statusOptions = [
     ['pending', 'Pending'], ['confirmed', 'Confirmed'], ['checked_in', 'Checked in'],
     ['checked_out', 'Checked out'], ['cancelled', 'Cancelled'], ['no_show', 'No show'],
@@ -609,7 +662,7 @@ function BookingsView({ bookings, onNewBooking, onUpdateBooking, onGuestNote, is
               <td><span className={`booking-status ${value.replaceAll('_', '-')}`}>{label}</span></td>
               {isGuest
                 ? <><td className="guest-note-cell">{booking.latest_guest_note || 'No messages yet'}</td><td><div className="guest-message-actions"><input aria-label={`Message team for ${id}`} placeholder="Write a note..." value={guestMessages[id] || ''} onChange={(event) => setGuestMessages((current) => ({ ...current, [id]: event.target.value }))} /><button className="text-button" disabled={!guestMessages[id]?.trim()} onClick={async () => { const sent = await onGuestNote(booking, guestMessages[id].trim()); if (sent) setGuestMessages((current) => ({ ...current, [id]: '' })) }}>Send</button></div></td></>
-                : <td><div className="booking-actions"><select aria-label={`Booking status ${id}`} value={value} onChange={(event) => setNextStatus((current) => ({ ...current, [id]: event.target.value }))}>{statusOptions.map(([option, optionLabel]) => <option key={option} value={option}>{optionLabel}</option>)}</select><input aria-label={`Staff remarks ${id}`} placeholder="Add a note" defaultValue={booking.staff_remarks || ''} onChange={(event) => setNextRemarks((current) => ({ ...current, [id]: event.target.value }))} /><button className="text-button" onClick={() => onUpdateBooking(booking, value, nextRemarks[id] ?? booking.staff_remarks ?? '')}>Save</button></div></td>}
+                : <td><div className="booking-actions"><select aria-label={`Booking status ${id}`} value={value} onChange={(event) => setNextStatus((current) => ({ ...current, [id]: event.target.value }))}>{statusOptions.map(([option, optionLabel]) => <option key={option} value={option}>{optionLabel}</option>)}</select><input aria-label={`Staff remarks ${id}`} placeholder="Add a note" defaultValue={booking.staff_remarks || ''} onChange={(event) => setNextRemarks((current) => ({ ...current, [id]: event.target.value }))} /><button className="text-button" disabled={!DEMO_MODE && (!Number.isSafeInteger(Number(booking.databaseId)) || Number(booking.databaseId) < 1)} title={!DEMO_MODE && (!Number.isSafeInteger(Number(booking.databaseId)) || Number(booking.databaseId) < 1) ? 'This booking has no database ID and cannot be updated.' : undefined} onClick={() => onUpdateBooking(booking, value, nextRemarks[id] ?? booking.staff_remarks ?? '')}>Save</button></div></td>}
             </tr>
           })}</tbody>
         </table>
@@ -926,8 +979,54 @@ function TeamView({ csrfToken, currentUserEmail, onToast }) {
   </section>
 }
 
-function RoomsSettings({ rooms, onRoomStatus, onNewBooking }) {
-  return <section className="panel table-panel"><div className="panel-heading"><div><h2>Every room, thoughtfully cared for.</h2><p>Update room readiness or welcome a new guest.</p></div><button className="button button-green" onClick={onNewBooking}><Plus size={16} /> New booking</button></div><div className="room-settings-grid">{rooms.map((room) => <article key={room.number} className="room-setting"><div><strong>Room {room.number}</strong><small>{room.type} · ₹{room.price.toLocaleString('en-IN')} / night</small></div><select aria-label={`Room ${room.number} status`} value={room.status} onChange={(event) => onRoomStatus(room.number, event.target.value)}><option value="available">Available</option><option value="occupied">Occupied</option><option value="cleaning">Cleaning</option><option value="maintenance">Maintenance</option></select></article>)}</div></section>
+function RoomsSettings({ rooms, roomTypes, canCreateRooms, onCreateRoom, onRoomStatus, onNewBooking }) {
+  const [showForm, setShowForm] = useState(false)
+  const [error, setError] = useState('')
+
+  async function submitRoom(event) {
+    event.preventDefault()
+    const form = event.currentTarget
+    const data = new FormData(form)
+    const roomNumber = String(data.get('room_number')).trim()
+    if (!roomNumber || rooms.some((room) => room.number.toLowerCase() === roomNumber.toLowerCase())) {
+      setError(roomNumber ? `Room ${roomNumber} already appears in the room list. Use a unique number.` : 'Enter a room number.')
+      return
+    }
+    setError('')
+    try {
+      await onCreateRoom({
+        room_number: roomNumber,
+        room_type_id: data.get('room_type_id'),
+        floor: String(data.get('floor')).trim(),
+        bed_configuration: String(data.get('bed_configuration')).trim(),
+        status: data.get('status'),
+        has_wifi: data.has('has_wifi'),
+        has_ac: data.has('has_ac'),
+        has_fridge: data.has('has_fridge'),
+        has_balcony: data.has('has_balcony'),
+      })
+      form.reset()
+      setShowForm(false)
+    } catch (requestError) {
+      setError(requestError.message)
+    }
+  }
+
+  return <section className="panel table-panel">
+    <div className="panel-heading"><div><h2>Every room, thoughtfully cared for.</h2><p>Update room readiness or welcome a new guest.</p></div><div className="room-settings-actions">{canCreateRooms && <button className="outline-button" onClick={() => { setShowForm((value) => !value); setError('') }}><Plus size={15} /> {showForm ? 'Close form' : 'Add a room'}</button>}<button className="button button-green" onClick={onNewBooking}><Plus size={16} /> New booking</button></div></div>
+    {showForm && <form className="room-create-form" onSubmit={submitRoom}>
+      <label>Room number<input name="room_number" required maxLength="20" placeholder="e.g. 101" /></label>
+      <label>Room type<select name="room_type_id" required defaultValue=""><option value="" disabled>Choose room type</option>{roomTypes.map((type) => <option key={type.id} value={type.id}>{type.name} · ₹{Number(type.base_price).toLocaleString('en-IN')} / night</option>)}</select></label>
+      <label>Floor <span className="optional">(optional)</span><input name="floor" maxLength="30" placeholder="e.g. Ground floor" /></label>
+      <label>Bed configuration <span className="optional">(optional)</span><input name="bed_configuration" maxLength="80" placeholder="e.g. King bed" /></label>
+      <label>Initial status<select name="status" defaultValue="available"><option value="available">Available for bookings</option><option value="cleaning">Being cleaned</option><option value="maintenance">Under maintenance</option></select></label>
+      <fieldset className="room-amenity-options"><legend>In-room amenities</legend><label><input type="checkbox" name="has_wifi" defaultChecked /> Wi-Fi</label><label><input type="checkbox" name="has_ac" defaultChecked /> Air conditioning</label><label><input type="checkbox" name="has_fridge" /> Fridge</label><label><input type="checkbox" name="has_balcony" /> Balcony</label></fieldset>
+      {roomTypes.length === 0 && <p className="form-error" role="alert">No active room types are configured. Ask the administrator to add room types first.</p>}
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <button className="button button-green" type="submit" disabled={!roomTypes.length}>Save room <Check size={15} /></button>
+    </form>}
+    <div className="room-settings-grid">{rooms.map((room) => <article key={room.number} className="room-setting"><div><strong>Room {room.number}</strong><small>{room.type} · ₹{room.price.toLocaleString('en-IN')} / night</small></div><select aria-label={`Room ${room.number} status`} value={room.status} onChange={(event) => onRoomStatus(room.number, event.target.value)}><option value="available">Available</option><option value="occupied">Occupied</option><option value="cleaning">Cleaning</option><option value="maintenance">Maintenance</option></select></article>)}{rooms.length === 0 && <p className="empty-state">No rooms have been added yet. Add your real room numbers and types to make them bookable.</p>}</div>
+  </section>
 }
 
 function Modal({ type, roomType, room, checkIn, checkOut, guests, onClose, onLogin, onBooking, onRoomStatus, onRoomBooking }) {
@@ -953,12 +1052,12 @@ function Modal({ type, roomType, room, checkIn, checkOut, guests, onClose, onLog
     const checkIn = data.get('checkIn')
     const checkOut = data.get('checkOut')
     if (!checkIn || !checkOut || checkOut <= checkIn) { setError('Please choose a check-out date after your check-in date.'); return }
-    const roomNumber = room?.number || '102'
+    const roomNumber = room?.number || null
     setError('')
     try {
-      await onBooking({ name: data.get('name'), email: data.get('email'), phone: data.get('phone'), checkIn, checkOut, roomType: roomType || room?.type || 'Garden Suite', roomNumber, source: 'Direct', adults: Number(data.get('adults') || guests || 2), total: (room?.price || 6400) * Math.max(1, Math.ceil((new Date(checkOut) - new Date(checkIn)) / 86400000)), remarks: data.get('remarks') })
+      await onBooking({ name: data.get('name'), email: data.get('email'), phone: data.get('phone'), checkIn, checkOut, roomType: room?.type || roomType || data.get('roomType') || 'Garden Suite', roomId: room?.id || null, roomNumber, source: 'Direct', adults: Number(data.get('adults') || guests || 2), total: (room?.price || 6400) * Math.max(1, Math.ceil((new Date(checkOut) - new Date(checkIn)) / 86400000)), remarks: data.get('remarks') })
     } catch (requestError) {
-      setError(requestError.message)
+      setError(bookingErrorMessage(requestError.message, room))
     }
   }
 
@@ -968,7 +1067,7 @@ function Modal({ type, roomType, room, checkIn, checkOut, guests, onClose, onLog
     <form className="modal-form" onSubmit={(event) => { event.preventDefault(); onRoomStatus(room.number, roomStatus) }}><label>Room status<select value={roomStatus} onChange={(event) => setRoomStatus(event.target.value)}><option value="available">Available</option><option value="occupied">Occupied</option><option value="cleaning">Cleaning</option><option value="maintenance">Maintenance</option></select></label><button className="button button-green modal-submit" type="submit">Save room status <Check size={16} /></button><button className="outline-button" type="button" onClick={() => onRoomBooking(room)}>Create a booking for this room <ArrowRight size={14} /></button></form>
   </> : isBooking ? <>
     <p className="eyebrow">A GOOD PLACE TO BEGIN</p><h2 id="modal-heading">Let’s make room for you.</h2><p className="modal-description">Tell us a little about your stay and our team will take it from here.</p>
-    <form className="modal-form" onSubmit={submitBooking}><label>Room to stay in<select name="roomType" defaultValue={roomType || room?.type || 'Garden Suite'}><option>Garden Suite</option><option>Deluxe King</option><option>Courtyard Twin</option><option>Palm Residence</option></select></label><div className="form-two-col"><label>Check in<input required type="date" name="checkIn" min={dateToday} defaultValue={checkIn || dateToday} /></label><label>Check out<input required type="date" name="checkOut" min={checkIn || dateToday} defaultValue={checkOut || dateAfterTwoNights} /></label></div><label>Guests<select name="adults" defaultValue={guests || '2'}><option value="1">1 guest</option><option value="2">2 guests</option><option value="3">3 guests</option><option value="4">4 guests</option></select></label><div className="form-two-col"><label>Your name<input required name="name" placeholder="Full name" autoComplete="name" /></label><label>Email address<input required type="email" name="email" placeholder="you@example.com" autoComplete="email" /></label></div><label>Phone number<input required type="tel" name="phone" placeholder="+91 98765 43210" autoComplete="tel" /></label><label>A note for us <span className="optional">(optional)</span><textarea name="remarks" rows="2" placeholder="An early check-in? A little birthday surprise?" /></label>{error && <p className="form-error" role="alert">{error}</p>}<button className="button button-green modal-submit" type="submit">Request your stay <ArrowRight size={16} /></button><p className="privacy-note">No payment needed now. Our team will be in touch to confirm.</p></form>
+    <form className="modal-form" onSubmit={submitBooking}><label>Room to stay in<select name="roomType" defaultValue={room?.type || roomType || 'Garden Suite'} disabled={Boolean(room)}><option>Garden Suite</option><option>Deluxe King</option><option>Courtyard Twin</option><option>Palm Residence</option></select>{room && <span className="optional">Room {room.number} selected</span>}</label><div className="form-two-col"><label>Check in<input required type="date" name="checkIn" min={dateToday} defaultValue={checkIn || dateToday} /></label><label>Check out<input required type="date" name="checkOut" min={checkIn || dateToday} defaultValue={checkOut || dateAfterTwoNights} /></label></div><label>Guests<select name="adults" defaultValue={guests || '2'}><option value="1">1 guest</option><option value="2">2 guests</option><option value="3">3 guests</option><option value="4">4 guests</option></select></label><div className="form-two-col"><label>Your name<input required name="name" placeholder="Full name" autoComplete="name" /></label><label>Email address<input required type="email" name="email" placeholder="you@example.com" autoComplete="email" /></label></div><label>Phone number<input required type="tel" name="phone" placeholder="+91 98765 43210" autoComplete="tel" /></label><label>A note for us <span className="optional">(optional)</span><textarea name="remarks" rows="2" placeholder="An early check-in? A little birthday surprise?" /></label>{error && <p className="form-error" role="alert">{error}</p>}<button className="button button-green modal-submit" type="submit">Request your stay <ArrowRight size={16} /></button><p className="privacy-note">No payment needed now. Our team will be in touch to confirm.</p></form>
   </> : <><p className="eyebrow">THE HOUSE, BEHIND THE HOUSE</p><h2 id="modal-heading">A warm welcome back.</h2><p className="modal-description">Sign in to look after the little details.</p><form className="modal-form" onSubmit={submitLogin}><label>Your name<input name="name" placeholder="Your name" /></label><label>Work email<input required type="email" name="email" placeholder="you@sereinhouse.in" /></label><label>Password<input required type="password" name="password" placeholder="Enter your password" minLength="4" /></label>{DEMO_MODE && <label>Your role<select name="role"><option value="reception">Receptionist</option><option value="owner">Property owner / Admin</option><option value="housekeeping">Housekeeping</option><option value="guest">Guest</option></select></label>}{error && <p className="form-error" role="alert">{error}</p>}<button className="button button-green modal-submit" type="submit">Sign in to the house <ArrowRight size={16} /></button><p className="privacy-note">{DEMO_MODE ? 'Demo access is enabled. Any email and password will open a preview workspace.' : 'Your access and permissions are managed by the hotel.'}</p></form></>}</section></div>
 }
 

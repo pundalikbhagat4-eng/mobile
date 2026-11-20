@@ -230,6 +230,76 @@ try {
         respond(['id' => $id], 201);
     }
 
+    if ($path === '/room-types' && $method === 'GET') {
+        requirePermission($pdo, 'rooms.create');
+        $rows = $pdo->query(
+            'SELECT id, name, description, priority, base_price, max_guests
+             FROM room_types WHERE is_active = 1 ORDER BY priority, name'
+        )->fetchAll();
+        respond(['room_types' => $rows]);
+    }
+
+    if ($path === '/rooms' && $method === 'POST') {
+        $userId = requirePermission($pdo, 'rooms.create');
+        requireCsrf();
+        $data = input();
+        $roomNumber = trim((string) ($data['room_number'] ?? ''));
+        $roomTypeId = filter_var($data['room_type_id'] ?? null, FILTER_VALIDATE_INT);
+        $floor = trim((string) ($data['floor'] ?? ''));
+        $bedConfiguration = trim((string) ($data['bed_configuration'] ?? ''));
+        $status = $data['status'] ?? 'available';
+        $booleanFields = ['has_wifi', 'has_ac', 'has_fridge', 'has_balcony'];
+        if ($roomNumber === '' || strlen($roomNumber) > 20 || !$roomTypeId
+            || strlen($floor) > 30 || strlen($bedConfiguration) > 80
+            || !in_array($status, ['available','cleaning','maintenance'], true)) {
+            respond(['error' => 'Enter a room number (up to 20 characters), choose a room type, and use valid floor, bed, and readiness details.'], 422);
+        }
+        foreach ($booleanFields as $field) {
+            if (isset($data[$field]) && !in_array($data[$field], [0, 1, true, false], true)) {
+                respond(['error' => "The {$field} setting must be on or off."], 422);
+            }
+        }
+        $roomTypeQuery = $pdo->prepare('SELECT id FROM room_types WHERE id = ? AND is_active = 1');
+        $roomTypeQuery->execute([$roomTypeId]);
+        if (!$roomTypeQuery->fetchColumn()) {
+            respond(['error' => 'That room type is no longer active. Refresh the form and choose another type.'], 422);
+        }
+        try {
+            $pdo->beginTransaction();
+            $insert = $pdo->prepare(
+                'INSERT INTO rooms
+                 (room_number, room_type_id, floor, status, bed_configuration,
+                  has_wifi, has_ac, has_fridge, has_balcony, created_by, updated_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            );
+            $insert->execute([
+                $roomNumber, $roomTypeId, $floor ?: null, $status, $bedConfiguration ?: null,
+                (int) (bool) ($data['has_wifi'] ?? true),
+                (int) (bool) ($data['has_ac'] ?? true),
+                (int) (bool) ($data['has_fridge'] ?? false),
+                (int) (bool) ($data['has_balcony'] ?? false),
+                $userId, $userId,
+            ]);
+            $id = (int) $pdo->lastInsertId();
+            audit($pdo, $userId, 'create', 'rooms', $id, ['room_number' => $roomNumber]);
+            $pdo->commit();
+        } catch (PDOException $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            if ($exception->getCode() === '23000') {
+                respond(['error' => "Room {$roomNumber} already exists. Enter a different room number."], 409);
+            }
+            throw $exception;
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $exception;
+        }
+        respond(['id' => $id, 'room_number' => $roomNumber, 'room_type_id' => $roomTypeId, 'status' => $status], 201);
+    }
+
     if ($path === '/rooms' && $method === 'GET') {
         requirePermission($pdo, 'rooms.view');
         $rows = $pdo->query(
@@ -385,16 +455,18 @@ try {
         try {
             if (!$roomId) {
                 $roomQuery = $pdo->prepare(
-                    "SELECT r.id, r.status, r.room_type_id, rt.base_price FROM rooms r
+                    "SELECT r.id, r.room_number, r.status, r.room_type_id, rt.base_price FROM rooms r
                      JOIN room_types rt ON rt.id = r.room_type_id
-                     WHERE rt.name = ? AND r.is_active = 1 AND r.status IN ('available','occupied')
+                     WHERE rt.name = ? AND r.is_active = 1
                      ORDER BY r.room_number FOR UPDATE"
                 );
                 $roomQuery->execute([$roomType]);
                 $matchingRooms = $roomQuery->fetchAll();
                 $room = null;
+                $hasBookableRoom = false;
                 foreach ($matchingRooms as $candidate) {
                     if (in_array($candidate['status'], ['available','occupied'], true)) {
+                        $hasBookableRoom = true;
                         $candidateOverlap = $pdo->prepare(
                             "SELECT id FROM reservations WHERE room_id = ? AND status IN ('pending','confirmed','checked_in')
                              AND check_in < ? AND check_out > ? LIMIT 1"
@@ -407,18 +479,33 @@ try {
                         }
                     }
                 }
+                if (!$room) {
+                    $pdo->rollBack();
+                    if (!$matchingRooms) {
+                        respond(['error' => "We don't have any active {$roomType} rooms right now. Please choose another room type or contact the hotel."], 409);
+                    }
+                    if (!$hasBookableRoom) {
+                        respond(['error' => "No {$roomType} rooms are currently marked ready to book. Please choose another room type or ask reception to check room readiness."], 409);
+                    }
+                    respond(['error' => "No {$roomType} rooms are free for those dates. Please choose different dates or another room type."], 409);
+                }
             } else {
                 $roomQuery = $pdo->prepare(
-                    "SELECT r.id, r.status, r.room_type_id, rt.base_price FROM rooms r
+                    "SELECT r.id, r.room_number, r.status, r.room_type_id, rt.base_price FROM rooms r
                      JOIN room_types rt ON rt.id = r.room_type_id
                      WHERE r.id = ? AND r.is_active = 1 FOR UPDATE"
                 );
                 $roomQuery->execute([$roomId]);
                 $room = $roomQuery->fetch();
-            }
-            if (!$room || !in_array($room['status'], ['available','occupied'], true)) {
-                $pdo->rollBack();
-                respond(['error' => 'That room is not available for a booking request.'], 409);
+                if (!$room) {
+                    $pdo->rollBack();
+                    respond(['error' => 'This room is no longer active. Refresh the room list and try again.'], 404);
+                }
+                if (!in_array($room['status'], ['available','occupied'], true)) {
+                    $pdo->rollBack();
+                    $status = str_replace('_', ' ', (string) $room['status']);
+                    respond(['error' => "Room {$room['room_number']} is marked {$status} and cannot be booked yet. Change its status to Available when it is ready, or choose another room."], 409);
+                }
             }
             $overlap = $pdo->prepare(
                 "SELECT id FROM reservations WHERE room_id = ? AND status IN ('pending','confirmed','checked_in')
@@ -427,7 +514,10 @@ try {
             $overlap->execute([$roomId, $checkOut, $checkIn]);
             if ($overlap->fetchColumn()) {
                 $pdo->rollBack();
-                respond(['error' => 'That room already has a reservation for part of those dates.'], 409);
+                if (isset($room['room_number'])) {
+                    respond(['error' => "Room {$room['room_number']} is already booked for some of those dates. Choose different dates or another room."], 409);
+                }
+                respond(['error' => 'That room is already booked for some of those dates. Please choose different dates or another room.'], 409);
             }
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {

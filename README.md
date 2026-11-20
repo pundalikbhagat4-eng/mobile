@@ -20,6 +20,14 @@ The web preview defaults to **demo mode**. Booking, room, team, role-permission,
 
 To point the web app to the PHP API, copy `.env.example` to `.env.local`, configure `VITE_API_BASE` for your API URL, and set `VITE_DEMO_MODE=false`. The API origin must match `HOTEL_ALLOWED_ORIGIN` in the PHP configuration. Live API-backed screens include login, bookings, room status, guest notes, contact requests, expenses, team accounts/role assignment, and revenue CSV export. The mobile app is not yet connected to live authentication or data.
 
+### Deploy to Hostinger
+
+1. Build the production website with `VITE_DEMO_MODE=false` and `VITE_API_BASE=/api`, then upload the contents of `dist/` to `public_html/`.
+2. Upload the root `.htaccess` to `public_html/.htaccess` and the API source files to `public_html/api/`, including `api/.htaccess`. The API directory must contain `index.php` and a configured `config.php`; the static website ZIP by itself does not include or deploy the PHP API.
+3. Create `public_html/api/config.php` on the server from `api/config.example.php`, setting the exact MySQL DSN, database username/password, `HOTEL_ALLOWED_ORIGIN` to the site's HTTPS origin, and `HOTEL_SESSION_SECURE` to `1`. Keep this file private and never upload it to GitHub or include it in a public website ZIP.
+4. Import `database/schema.sql` into the Hostinger MySQL database. After deployment, open `https://your-domain/api/health`; a JSON `{"status":"ok"}` confirms PHP routing is active. Then create the first administrator using the CLI bootstrap if SSH/PHP CLI is enabled.
+5. Sign in as an administrator, open **Settings → Add a room**, and enter the hotel's real room numbers and types. The schema seeds room types but intentionally does not invent room inventory. Set rooms to **Available for bookings** when they are ready; public bookings need at least one active, available room of the selected type for those dates.
+
 ## PHP and MySQL
 
 1. Install PHP 8.1+ with PDO MySQL and MySQL 8.
@@ -37,6 +45,7 @@ The API uses prepared queries, password hashes, HTTP-only sessions, CSRF tokens 
 - `POST /api/bookings` (public request or authenticated booking creation)
 - `GET /api/bookings`, `PATCH /api/bookings/{id}`
 - `GET /api/rooms`, `PATCH /api/rooms/{id}`
+- `GET /api/room-types`, `POST /api/rooms` (add real, bookable inventory)
 - `GET /api/users`, `POST /api/users`, `PATCH /api/users/{id}`
 - `GET /api/roles`, `POST /api/roles`, `PATCH /api/roles/{id}/permissions`
 - `GET /api/expenses`, `POST /api/expenses`

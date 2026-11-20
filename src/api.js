@@ -18,7 +18,11 @@ export async function apiRequest(path, { method = 'GET', body, csrfToken } = {})
 
   const result = await response.json().catch(() => ({}))
   if (!response.ok) {
-    throw new Error(result.error || `The request failed (${response.status}).`)
+    if (result.error) throw new Error(result.error)
+    if (response.status === 404) {
+      throw new Error('The hotel service could not find this API route. Please ask the site administrator to check the PHP API deployment.')
+    }
+    throw new Error(`The request could not be completed (${response.status}). Please try again or contact the hotel team.`)
   }
   return result
 }
